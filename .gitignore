@@ -1,0 +1,10 @@
+/lbstatz
+/dist/
+
+# Local config holds your token — never commit it.
+/lbstatz.toml
+
+# Databases and SQLite sidecar files.
+*.db
+*.db-wal
+*.db-shm
