@@ -1,0 +1,11 @@
+# Copy this to lbstatz.toml next to the binary (or point at it with --config).
+# Your ListenBrainz user token, from https://listenbrainz.org/settings/
+# Optional for reading public listens, required for private ones.
+token = ""
+
+# Your ListenBrainz username. Required.
+username = ""
+
+# Where to keep the local SQLite database.
+# Optional; defaults to lbstatz.db next to this config file.
+# db_path = "~/.local/share/lbstatz/lbstatz.db"
