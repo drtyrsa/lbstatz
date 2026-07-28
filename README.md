@@ -95,3 +95,7 @@ Shared by `top` and `listens`:
 ```sh
 go test ./...
 ```
+
+## License
+
+[MIT](LICENSE)
