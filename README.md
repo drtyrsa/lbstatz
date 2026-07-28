@@ -38,8 +38,11 @@ lbstatz sync                 # incremental: only listens newer than what you alr
 lbstatz sync --from-scratch  # wipe and re-download the entire history
 ```
 
-Incremental sync is the default and only fetches what's new. Interrupt any time with
-Ctrl-C; whatever was downloaded is kept and the next run resumes.
+Incremental sync is the default: it tops up listens newer than what you have and, until
+the whole history has been downloaded once, keeps backfilling older listens from where it
+left off. It's fully resumable — interrupt any time with Ctrl-C, and network hiccups are
+retried automatically. For a large history the first sync may take several runs; just run
+`sync` again until it reports `Done`. Progress is shown against your total listen count.
 
 ### `top`
 

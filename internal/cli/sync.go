@@ -43,12 +43,20 @@ func newSyncCmd(configPath *string) *cobra.Command {
 				return err
 			}
 
-			total, _ := st.Count(context.Background())
+			bg := context.Background()
+			stored, _ := st.Count(bg)
+			remote, _ := client.ListenCount(bg)
+			backfillDone, _ := st.BackfillComplete(bg)
+
 			if errors.Is(err, context.Canceled) {
-				prog.finish(fmt.Sprintf("Interrupted: %d new listens saved (total %d).", n, total))
+				prog.finish(fmt.Sprintf("Interrupted: %d new listens saved (%s). Run sync again to continue.", n, storedOf(stored, remote)))
 				return nil
 			}
-			prog.finish(fmt.Sprintf("Done: %d new listens (total %d).", n, total))
+			if !backfillDone && remote > stored {
+				prog.finish(fmt.Sprintf("Stopped early: %d new listens saved (%s). Run sync again to continue.", n, storedOf(stored, remote)))
+				return nil
+			}
+			prog.finish(fmt.Sprintf("Done: %d new listens (%s).", n, storedOf(stored, remote)))
 			return nil
 		},
 	}
@@ -56,8 +64,17 @@ func newSyncCmd(configPath *string) *cobra.Command {
 	return cmd
 }
 
-// syncListens pages backwards through the user's history. A full sync walks to the
-// oldest listen; an incremental sync stops once it reaches listens already stored.
+func storedOf(stored, remote int64) string {
+	if remote > 0 {
+		return fmt.Sprintf("%d of %d stored", stored, remote)
+	}
+	return fmt.Sprintf("%d stored", stored)
+}
+
+// syncListens brings the local database up to date in two phases. First it tops up any
+// listens newer than what is stored. Then, unless a previous run already walked the whole
+// history, it backfills older listens starting below the oldest stored one. Because the
+// backfill cursor is the oldest stored timestamp, an interrupted sync resumes cleanly.
 func syncListens(ctx context.Context, client listenSource, st *store.Store, fromScratch bool, report func(done, total int64)) (int, error) {
 	if fromScratch {
 		if err := st.Clear(ctx); err != nil {
@@ -65,37 +82,72 @@ func syncListens(ctx context.Context, client listenSource, st *store.Store, from
 		}
 	}
 
-	boundary, err := st.MaxListenedAt(ctx)
-	if err != nil {
-		return 0, err
-	}
-	localBefore, err := st.Count(ctx)
-	if err != nil {
-		return 0, err
-	}
-
 	remoteTotal, _ := client.ListenCount(ctx)
-	target := remoteTotal
-	if !fromScratch {
-		target = remoteTotal - localBefore
-		if target < 0 {
-			target = 0
-		}
+	storedBefore, err := st.Count(ctx)
+	if err != nil {
+		return 0, err
 	}
 
 	newCount := 0
-	var maxTS int64
+	progress := func() {
+		if report != nil {
+			report(storedBefore+int64(newCount), remoteTotal)
+		}
+	}
+	progress()
+
+	newest, err := st.MaxListenedAt(ctx)
+	if err != nil {
+		return newCount, err
+	}
+	if newest > 0 {
+		if _, err := walkBack(ctx, client, st, 0, newest, &newCount, progress); err != nil {
+			return newCount, err
+		}
+	}
+
+	backfillDone, err := st.BackfillComplete(ctx)
+	if err != nil {
+		return newCount, err
+	}
+	if !backfillDone {
+		oldest, err := st.MinListenedAt(ctx)
+		if err != nil {
+			return newCount, err
+		}
+		// max_ts is exclusive; +1 re-requests the boundary second so listens sharing it aren't skipped.
+		cursor := oldest
+		if cursor > 0 {
+			cursor++
+		}
+		reachedOldest, err := walkBack(ctx, client, st, cursor, 0, &newCount, progress)
+		if err != nil {
+			return newCount, err
+		}
+		if reachedOldest {
+			if err := st.SetBackfillComplete(ctx, true); err != nil {
+				return newCount, err
+			}
+		}
+	}
+	return newCount, nil
+}
+
+// walkBack pages from maxTS (0 = most recent) toward older listens, storing each page.
+// It stops at boundary (exclusive; 0 = no boundary) or when the history runs out, and
+// reports whether it reached the oldest listen.
+func walkBack(ctx context.Context, client listenSource, st *store.Store, maxTS, boundary int64, newCount *int, progress func()) (bool, error) {
 	for {
 		if err := ctx.Err(); err != nil {
-			return newCount, err
+			return false, err
 		}
 
 		page, err := client.Page(ctx, maxTS)
 		if err != nil {
-			return newCount, err
+			return false, err
 		}
 		if len(page.Listens) == 0 {
-			break
+			return true, nil
 		}
 
 		batch := page.Listens
@@ -103,7 +155,7 @@ func syncListens(ctx context.Context, client listenSource, st *store.Store, from
 		if boundary > 0 {
 			kept := batch[:0]
 			for _, l := range page.Listens {
-				if l.ListenedAt > boundary {
+				if l.ListenedAt >= boundary {
 					kept = append(kept, l)
 				} else {
 					reachedBoundary = true
@@ -114,17 +166,17 @@ func syncListens(ctx context.Context, client listenSource, st *store.Store, from
 
 		inserted, err := st.UpsertListens(ctx, batch)
 		if err != nil {
-			return newCount, err
+			return false, err
 		}
-		newCount += inserted
-		if report != nil {
-			report(int64(newCount), target)
-		}
+		*newCount += inserted
+		progress()
 
-		if reachedBoundary || len(page.Listens) < listenbrainz.MaxItemsPerGet {
-			break
+		if reachedBoundary {
+			return false, nil
+		}
+		if len(page.Listens) < listenbrainz.MaxItemsPerGet {
+			return true, nil
 		}
 		maxTS = page.Listens[len(page.Listens)-1].ListenedAt
 	}
-	return newCount, nil
 }

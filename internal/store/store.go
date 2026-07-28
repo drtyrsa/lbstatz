@@ -29,7 +29,14 @@ CREATE TABLE IF NOT EXISTS listens (
 	PRIMARY KEY (listened_at, recording_msid)
 );
 CREATE INDEX IF NOT EXISTS idx_listens_listened_at ON listens(listened_at);
+
+CREATE TABLE IF NOT EXISTS meta (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
 `
+
+const metaBackfillComplete = "backfill_complete"
 
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
@@ -92,15 +99,48 @@ func (s *Store) Count(ctx context.Context) (int64, error) {
 
 // MaxListenedAt returns the newest stored listen timestamp, or 0 when empty.
 func (s *Store) MaxListenedAt(ctx context.Context) (int64, error) {
+	return s.boundaryTS(ctx, "MAX")
+}
+
+// MinListenedAt returns the oldest stored listen timestamp, or 0 when empty.
+func (s *Store) MinListenedAt(ctx context.Context) (int64, error) {
+	return s.boundaryTS(ctx, "MIN")
+}
+
+func (s *Store) boundaryTS(ctx context.Context, agg string) (int64, error) {
 	var ts sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT MAX(listened_at) FROM listens`).Scan(&ts); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT `+agg+`(listened_at) FROM listens`).Scan(&ts); err != nil {
 		return 0, err
 	}
 	return ts.Int64, nil
 }
 
+// BackfillComplete reports whether the entire history has been downloaded at least once.
+func (s *Store) BackfillComplete(ctx context.Context) (bool, error) {
+	var v string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, metaBackfillComplete).Scan(&v)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return v == "1", err
+}
+
+func (s *Store) SetBackfillComplete(ctx context.Context, done bool) error {
+	v := "0"
+	if done {
+		v = "1"
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		metaBackfillComplete, v)
+	return err
+}
+
 func (s *Store) Clear(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM listens`)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM listens`); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM meta`)
 	return err
 }
 

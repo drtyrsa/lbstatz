@@ -30,6 +30,16 @@ func listen(ts int64, id string) listenbrainz.Listen {
 	return listenbrainz.Listen{ListenedAt: ts, RecordingMSID: id, ArtistName: "A", TrackName: id}
 }
 
+// descendingPage builds a page of n listens with strictly decreasing timestamps below startTS.
+func descendingPage(prefix string, startTS int64, n int) []listenbrainz.Listen {
+	out := make([]listenbrainz.Listen, n)
+	for i := range out {
+		ts := startTS - int64(i)
+		out[i] = listen(ts, prefix+strconv.FormatInt(ts, 10))
+	}
+	return out
+}
+
 func newStore(t *testing.T) *store.Store {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
@@ -40,19 +50,10 @@ func newStore(t *testing.T) *store.Store {
 	return st
 }
 
-func TestSyncFromScratchPaginates(t *testing.T) {
-	// Two "full" pages of MaxItemsPerGet, then a short page ends the walk.
+func TestSyncFullWalkThenTopUpOnly(t *testing.T) {
 	full := listenbrainz.MaxItemsPerGet
-	page1 := make([]listenbrainz.Listen, full)
-	for i := range page1 {
-		ts := int64(10000 - i)
-		page1[i] = listen(ts, "a"+strconv.FormatInt(ts, 10))
-	}
-	page2 := make([]listenbrainz.Listen, full)
-	for i := range page2 {
-		ts := int64(10000 - full - i)
-		page2[i] = listen(ts, "b"+strconv.FormatInt(ts, 10))
-	}
+	page1 := descendingPage("a", 10000, full)
+	page2 := descendingPage("b", page1[full-1].ListenedAt-1, full)
 	page3 := []listenbrainz.Listen{listen(1, "c1")}
 
 	src := &fakeSource{
@@ -64,25 +65,80 @@ func TestSyncFromScratchPaginates(t *testing.T) {
 		},
 	}
 	st := newStore(t)
+	ctx := context.Background()
 
-	n, err := syncListens(context.Background(), src, st, true, nil)
+	n, err := syncListens(ctx, src, st, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := 2*full + 1; n != want {
 		t.Fatalf("new = %d, want %d", n, want)
 	}
-	if c, _ := st.Count(context.Background()); c != int64(2*full+1) {
-		t.Fatalf("stored = %d", c)
+	if done, _ := st.BackfillComplete(ctx); !done {
+		t.Fatal("backfill should be marked complete")
+	}
+
+	// A second sync must only top up (phase 1) and never re-walk the history.
+	callsAfterFull := src.calls
+	n2, err := syncListens(ctx, src, st, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n2 != 0 {
+		t.Fatalf("second sync added %d, want 0", n2)
+	}
+	if got := src.calls - callsAfterFull; got != 1 {
+		t.Fatalf("second sync made %d page calls, want 1 (top-up only)", got)
 	}
 }
 
-func TestSyncIncrementalStopsAtBoundary(t *testing.T) {
+func TestSyncResumesInterruptedBackfill(t *testing.T) {
+	full := listenbrainz.MaxItemsPerGet
+	newest := descendingPage("a", 10000, full) // the chunk a prior interrupted run stored
+	older := descendingPage("b", newest[full-1].ListenedAt-1, 42)
+
 	st := newStore(t)
 	ctx := context.Background()
 
-	// Pre-seed one listen; incremental sync should only add newer ones.
+	// Simulate the interrupted state: newest chunk present, backfill not complete.
+	if _, err := st.UpsertListens(ctx, newest); err != nil {
+		t.Fatal(err)
+	}
+	if done, _ := st.BackfillComplete(ctx); done {
+		t.Fatal("precondition: backfill must be incomplete")
+	}
+
+	src := &fakeSource{
+		total: int64(full + len(older)),
+		pages: map[int64]*listenbrainz.Page{
+			0:                             {Listens: newest},
+			newest[full-1].ListenedAt + 1: {Listens: older},
+		},
+	}
+
+	n, err := syncListens(ctx, src, st, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(older) {
+		t.Fatalf("new = %d, want %d", n, len(older))
+	}
+	if c, _ := st.Count(ctx); c != int64(full+len(older)) {
+		t.Fatalf("stored = %d, want %d", c, full+len(older))
+	}
+	if done, _ := st.BackfillComplete(ctx); !done {
+		t.Fatal("backfill should now be complete")
+	}
+}
+
+func TestSyncTopUpStopsAtBoundary(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+
 	if _, err := st.UpsertListens(ctx, []listenbrainz.Listen{listen(100, "old")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetBackfillComplete(ctx, true); err != nil {
 		t.Fatal(err)
 	}
 

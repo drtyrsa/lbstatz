@@ -50,7 +50,7 @@ func New(baseURL, token, username string) *Client {
 		BaseURL:  baseURL,
 		Token:    token,
 		Username: username,
-		http:     &http.Client{Timeout: 30 * time.Second},
+		http:     &http.Client{Timeout: 90 * time.Second},
 		sleep:    time.Sleep,
 	}
 }
@@ -89,8 +89,11 @@ func (c *Client) ListenCount(ctx context.Context) (int64, error) {
 	return resp.Payload.Count, nil
 }
 
+const maxAttempts = 6
+
 func (c *Client) get(ctx context.Context, endpoint string, out any) error {
-	for attempt := 0; ; attempt++ {
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return err
@@ -101,15 +104,25 @@ func (c *Client) get(ctx context.Context, endpoint string, out any) error {
 
 		resp, err := c.http.Do(req)
 		if err != nil {
-			return err
+			if ctx.Err() != nil {
+				return err
+			}
+			lastErr = err
+			c.sleep(backoff(attempt))
+			continue
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
+			delay := resetDelay(resp.Header)
 			resp.Body.Close()
-			if attempt >= 5 {
-				return fmt.Errorf("rate limited by %s after %d attempts", endpoint, attempt)
-			}
-			c.sleep(resetDelay(resp.Header))
+			lastErr = fmt.Errorf("GET %s: rate limited", endpoint)
+			c.sleep(delay)
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("GET %s: %s", endpoint, resp.Status)
+			c.sleep(backoff(attempt))
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -130,6 +143,11 @@ func (c *Client) get(ctx context.Context, endpoint string, out any) error {
 		}
 		return nil
 	}
+	return fmt.Errorf("giving up after %d attempts: %w", maxAttempts, lastErr)
+}
+
+func backoff(attempt int) time.Duration {
+	return time.Duration(attempt) * 2 * time.Second
 }
 
 func resetDelay(h http.Header) time.Duration {
