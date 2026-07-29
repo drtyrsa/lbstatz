@@ -159,18 +159,16 @@ func (s *Store) Top(ctx context.Context, entity Entity, f Filter, limit int) ([]
 		return s.topArtists(ctx, f, limit)
 	}
 
-	var keyExpr, nameCol, artistSelect, mbidCol, notEmpty string
+	var keyExpr, nameCol, mbidCol, notEmpty string
 	switch entity {
 	case Albums:
 		keyExpr = "CASE WHEN release_mbid <> '' THEN 'm:'||release_mbid ELSE 'n:'||lower(artist_name)||'|'||lower(release_name) END"
 		nameCol = "release_name"
-		artistSelect = "MAX(artist_name)"
 		mbidCol = "release_mbid"
 		notEmpty = "(release_name <> '' OR release_mbid <> '')"
 	case Tracks:
 		keyExpr = "CASE WHEN recording_mbid <> '' THEN 'm:'||recording_mbid ELSE 'n:'||lower(artist_name)||'|'||lower(track_name) END"
 		nameCol = "track_name"
-		artistSelect = "MAX(artist_name)"
 		mbidCol = "recording_mbid"
 		notEmpty = "(track_name <> '' OR recording_mbid <> '')"
 	default:
@@ -184,12 +182,24 @@ func (s *Store) Top(ctx context.Context, entity Entity, f Filter, limit int) ([]
 		whereClause += " AND " + notEmpty
 	}
 
+	// Label each group with its most-common (name, artist) pair rather than MAX(), which would
+	// surface a lexicographically-largest outlier (e.g. a stray track name in the release field).
 	q := fmt.Sprintf(`
-		SELECT COUNT(*) AS c, MAX(%s), %s, MAX(%s)
-		FROM listens%s
-		GROUP BY %s
-		ORDER BY c DESC, MAX(%s) ASC`,
-		nameCol, artistSelect, mbidCol, whereClause, keyExpr, nameCol)
+		WITH f AS (
+			SELECT artist_name, %s AS nm, %s AS mb, %s AS k
+			FROM listens%s
+		)
+		SELECT lbl.name, g.c, lbl.artist, COALESCE(g.mbid, '')
+		FROM (SELECT k, COUNT(*) AS c, MAX(mb) AS mbid FROM f GROUP BY k) g
+		JOIN (
+			SELECT k, nm AS name, artist_name AS artist FROM (
+				SELECT k, nm, artist_name,
+					ROW_NUMBER() OVER (PARTITION BY k ORDER BY COUNT(*) DESC, nm) AS rn
+				FROM f GROUP BY k, nm, artist_name
+			) WHERE rn = 1
+		) lbl ON lbl.k = g.k
+		ORDER BY g.c DESC, lbl.name ASC`,
+		nameCol, mbidCol, keyExpr, whereClause)
 	if limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -205,7 +215,7 @@ func (s *Store) Top(ctx context.Context, entity Entity, f Filter, limit int) ([]
 	for rows.Next() {
 		rank++
 		var r TopRow
-		if err := rows.Scan(&r.Count, &r.Name, &r.Artist, &r.MBID); err != nil {
+		if err := rows.Scan(&r.Name, &r.Count, &r.Artist, &r.MBID); err != nil {
 			return nil, err
 		}
 		r.Rank = rank

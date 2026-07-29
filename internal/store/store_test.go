@@ -201,6 +201,42 @@ func TestListens(t *testing.T) {
 	}
 }
 
+func TestTopAlbumsUseMostCommonNameAndArtist(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "mode.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+
+	rel := "cccccccc-0000-0000-0000-000000000001"
+	var listens []listenbrainz.Listen
+	for i := 0; i < 4; i++ {
+		listens = append(listens, mk(base+int64(i), "r"+strconv.Itoa(i), "Band", "t"+strconv.Itoa(i), "Real Album", "artmbid", "rec"+strconv.Itoa(i), rel))
+	}
+	// Lexicographically-largest outliers that MAX() would wrongly surface.
+	listens = append(listens,
+		mk(base+10, "o1", "Band feat. Zed", "zzz", "Zzz Stray Name", "artmbid", "reco1", rel),
+	)
+	if _, err := s.UpsertListens(ctx, listens); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.Top(ctx, Albums, Filter{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 album, got %d: %+v", len(rows), rows)
+	}
+	if rows[0].Name != "Real Album" || rows[0].Artist != "Band" || rows[0].Count != 5 {
+		t.Fatalf("row = %+v, want name=Real Album artist=Band count=5", rows[0])
+	}
+	if rows[0].MBID != rel {
+		t.Fatalf("mbid = %q, want %q", rows[0].MBID, rel)
+	}
+}
+
 func TestTopArtistsMergeByNameAcrossMBIDVariants(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "merge.db"))
 	if err != nil {
