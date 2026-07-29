@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/drtyrsa/lbstatz/internal/listenbrainz"
@@ -197,6 +198,49 @@ func TestListens(t *testing.T) {
 	}
 	if rows[0].TrackName != "Idioteque" {
 		t.Errorf("track = %q", rows[0].TrackName)
+	}
+}
+
+func TestTopArtistsMergeByNameAcrossMBIDVariants(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "merge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+
+	primary := "aaaaaaaa-0000-0000-0000-000000000001"
+	dupMBID := "bbbbbbbb-0000-0000-0000-000000000002"
+
+	var listens []listenbrainz.Listen
+	// Same name, same primary MBID but different contributor sets (the collaboration case).
+	for i := 0; i < 5; i++ {
+		l := mk(base+int64(i), "p"+strconv.Itoa(i), "Onefish", "t", "r", primary, "rec"+strconv.Itoa(i), "")
+		l.ArtistMBIDs = []string{primary, "guest" + strconv.Itoa(i)}
+		listens = append(listens, l)
+	}
+	// Same name, a duplicate MusicBrainz entity, and some with no MBID at all.
+	listens = append(listens,
+		mk(base+10, "q1", "Onefish", "t", "r", dupMBID, "recq", ""),
+		mk(base+11, "n1", "Onefish", "t", "r", "", "recn1", ""),
+		mk(base+12, "n2", "onefish", "t", "r", "", "recn2", ""),
+	)
+	if _, err := s.UpsertListens(ctx, listens); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.Top(ctx, Artists, Filter{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 merged artist row, got %d: %+v", len(rows), rows)
+	}
+	if rows[0].Count != 8 {
+		t.Fatalf("count = %d, want 8", rows[0].Count)
+	}
+	if rows[0].MBID != primary {
+		t.Fatalf("mbid = %q, want most-common %q", rows[0].MBID, primary)
 	}
 }
 

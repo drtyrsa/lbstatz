@@ -86,12 +86,14 @@ Shared by `top` and `listens`:
   treated as an MBID; otherwise it's a name. Name matching is exact and case-insensitive.
 - **Albums** are releases exactly as your listens report them — a deluxe edition and the
   standard edition count separately.
-- **Missing MBIDs.** Many listens carry no MBIDs. Entities are keyed by MBID when present
-  and fall back to name text otherwise, so nothing is dropped.
-- **Collaborations.** Each distinct artist credit ("Röyksopp & Susanne Sundfør") is its
-  own artist. Filtering `--artist <name>` matches that exact credit, while filtering
-  `--artist <mbid>` matches *every* credit that artist appears on — handy for "all albums
-  this artist plays on, including collaborations".
+- **Missing MBIDs.** Many listens carry no MBIDs. Albums and tracks are keyed by MBID when
+  present (so different credits of the same recording or release merge) and fall back to
+  name otherwise, so nothing is dropped.
+- **Artists** are grouped by their credited name, case-insensitively — the way your listens
+  are labelled — so everything scrobbled as "Skrillex" is one artist, while a genuinely
+  different credit like "Skrillex & Diplo" is its own. Each artist is tagged with its
+  most-common MBID. Filtering `--artist <name>` matches that exact credit; `--artist <mbid>`
+  matches *every* listen that artist appears on, including collaborations.
 
 ## Tests
 

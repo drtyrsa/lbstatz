@@ -102,15 +102,65 @@ func addMatch(conds *[]string, args *[]any, value, mbidCol, nameCol string) {
 	*args = append(*args, value)
 }
 
+// topArtists groups by artist name (case-insensitive), matching how listens are credited,
+// and labels each group with its most frequently used MBID. Grouping by name rather than by
+// the contributor MBID set keeps one artist as one row instead of splitting per collaboration.
+func (s *Store) topArtists(ctx context.Context, f Filter, limit int) ([]TopRow, error) {
+	whereClause, args := f.where()
+	guard := "artist_name <> ''"
+	if whereClause == "" {
+		whereClause = " WHERE " + guard
+	} else {
+		whereClause += " AND " + guard
+	}
+
+	q := `
+		SELECT a.name, a.c, COALESCE(m.mbid, '')
+		FROM (
+			SELECT lower(artist_name) AS lname, MAX(artist_name) AS name, COUNT(*) AS c
+			FROM listens` + whereClause + `
+			GROUP BY lower(artist_name)
+		) a
+		LEFT JOIN (
+			SELECT lname, mbid FROM (
+				SELECT lower(artist_name) AS lname, artist_mbid AS mbid,
+					ROW_NUMBER() OVER (PARTITION BY lower(artist_name) ORDER BY COUNT(*) DESC, artist_mbid) AS rn
+				FROM listens
+				WHERE artist_mbid <> ''
+				GROUP BY lower(artist_name), artist_mbid
+			) WHERE rn = 1
+		) m ON m.lname = a.lname
+		ORDER BY a.c DESC, a.name ASC`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+
+	rows, err := s.query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TopRow
+	rank := 0
+	for rows.Next() {
+		rank++
+		r := TopRow{Rank: rank}
+		if err := rows.Scan(&r.Name, &r.Count, &r.MBID); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) Top(ctx context.Context, entity Entity, f Filter, limit int) ([]TopRow, error) {
+	if entity == Artists {
+		return s.topArtists(ctx, f, limit)
+	}
+
 	var keyExpr, nameCol, artistSelect, mbidCol, notEmpty string
 	switch entity {
-	case Artists:
-		keyExpr = "CASE WHEN artist_mbids <> '' THEN 'm:'||artist_mbids ELSE 'n:'||lower(artist_name) END"
-		nameCol = "artist_name"
-		artistSelect = "''"
-		mbidCol = "artist_mbid"
-		notEmpty = "(artist_name <> '' OR artist_mbids <> '')"
 	case Albums:
 		keyExpr = "CASE WHEN release_mbid <> '' THEN 'm:'||release_mbid ELSE 'n:'||lower(artist_name)||'|'||lower(release_name) END"
 		nameCol = "release_name"
