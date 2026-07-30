@@ -53,6 +53,7 @@ lbstatz top artists
 lbstatz top tracks  --artist "Radiohead"                 # top tracks by an artist
 lbstatz top tracks  --album  "OK Computer"               # top tracks on an album
 lbstatz top albums  --artist "Radiohead" --from 2024-01-01 --to 2024-12-31
+lbstatz top albums  --last 30                            # the last 30 days
 lbstatz top tracks  --track  "Karma Police"              # one row: total plays of a track
 lbstatz top artists -n 20 --json
 ```
@@ -64,6 +65,7 @@ The raw listen log, most recent first — same filters as `top`.
 ```sh
 lbstatz listens --artist "Björk" -n 50
 lbstatz listens --album "Homogenic" --from 2023-06-01 --json
+lbstatz listens --last 7                                 # everything from the last week
 ```
 
 ## Flags
@@ -74,6 +76,7 @@ Shared by `top` and `listens`:
 |------|---------|
 | `--from` | Start date, inclusive. `YYYY-MM-DD` or RFC3339. |
 | `--to` | End date, inclusive (a bare date covers the whole day). |
+| `--last` | Last N days, today included (`--last 7` = today plus the previous six). Cannot be combined with `--from`/`--to`. |
 | `--artist` | Filter by artist, as a name or MBID. |
 | `--album` | Filter by album (release), as a name or MBID. |
 | `--track` | Filter by track (recording), as a name or MBID. |
