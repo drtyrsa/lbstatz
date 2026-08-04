@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/drtyrsa/lbstatz/internal/listenbrainz"
+	"github.com/drtyrsa/lbstatz/internal/musicbrainz"
 	"github.com/drtyrsa/lbstatz/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -18,11 +19,15 @@ type listenSource interface {
 
 func newSyncCmd(configPath *string) *cobra.Command {
 	var fromScratch bool
+	var noEnrich bool
 
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Download listens from ListenBrainz into the local database",
-		Args:  cobra.NoArgs,
+		Long: "Download listens into the local database, then fetch metadata for any new\n" +
+			"recordings and artists so the genre, country and era stats stay current.\n" +
+			"Both halves are resumable; interrupt with Ctrl-C and run sync again.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(*configPath)
 			if err != nil {
@@ -56,11 +61,33 @@ func newSyncCmd(configPath *string) *cobra.Command {
 				prog.finish(fmt.Sprintf("Stopped early: %d new listens saved (%s). Run sync again to continue.", n, storedOf(stored, remote)))
 				return nil
 			}
-			prog.finish(fmt.Sprintf("Done: %d new listens (%s).", n, storedOf(stored, remote)))
+			prog.finish(fmt.Sprintf("Downloaded %d new listens (%s).", n, storedOf(stored, remote)))
+
+			if noEnrich {
+				return nil
+			}
+
+			// Metadata is keyed by MBID, so this only ever fetches entities the database does
+			// not already describe — re-running sync costs nothing once it has caught up.
+			mb := musicbrainz.New(musicbrainz.DefaultBaseURL)
+			stats, err := enrichAll(cmd.Context(), client, mb, st, os.Stderr)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				return err
+			}
+			if errors.Is(err, context.Canceled) {
+				fmt.Fprintf(os.Stderr, "Interrupted: enriched %s. Run sync again to continue.\n", stats)
+				return nil
+			}
+			if stats.empty() {
+				fmt.Fprintln(os.Stderr, "Done: metadata already up to date.")
+			} else {
+				fmt.Fprintf(os.Stderr, "Done: enriched %s.\n", stats)
+			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&fromScratch, "from-scratch", false, "re-download the entire history instead of only new listens")
+	cmd.Flags().BoolVar(&noEnrich, "no-enrich", false, "download listens only, skipping the metadata pass")
 	return cmd
 }
 

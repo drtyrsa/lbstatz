@@ -22,7 +22,9 @@ func NewRootCmd() *cobra.Command {
 
 	root.AddCommand(
 		newSyncCmd(&configPath),
+		newEnrichCmd(&configPath),
 		newTopCmd(&configPath),
+		newErasCmd(&configPath),
 		newListensCmd(&configPath),
 	)
 	return root
