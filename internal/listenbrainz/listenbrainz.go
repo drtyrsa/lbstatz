@@ -91,9 +91,26 @@ func (c *Client) ListenCount(ctx context.Context) (int64, error) {
 
 const maxAttempts = 6
 
+// ServerError reports a 5xx the server kept returning. Callers batching many items use it
+// to tell a server-side problem from a malformed request and retry in smaller pieces.
+type ServerError struct {
+	Endpoint string
+	Status   string
+}
+
+func (e *ServerError) Error() string {
+	return fmt.Sprintf("GET %s: %s", e.Endpoint, e.Status)
+}
+
 func (c *Client) get(ctx context.Context, endpoint string, out any) error {
+	return c.getWithAttempts(ctx, endpoint, out, maxAttempts)
+}
+
+// getWithAttempts retries up to attempts times. Callers holding a request they can make
+// smaller pass a lower budget, because for those, shrinking the request beats waiting.
+func (c *Client) getWithAttempts(ctx context.Context, endpoint string, out any, attempts int) error {
 	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return err
@@ -121,7 +138,7 @@ func (c *Client) get(ctx context.Context, endpoint string, out any) error {
 		}
 		if resp.StatusCode >= 500 {
 			resp.Body.Close()
-			lastErr = fmt.Errorf("GET %s: %s", endpoint, resp.Status)
+			lastErr = &ServerError{Endpoint: endpoint, Status: resp.Status}
 			c.sleep(backoff(attempt))
 			continue
 		}
@@ -143,12 +160,16 @@ func (c *Client) get(ctx context.Context, endpoint string, out any) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("giving up after %d attempts: %w", maxAttempts, lastErr)
+	return fmt.Errorf("giving up after %d attempts: %w", attempts, lastErr)
 }
 
+// backoff grows exponentially rather than linearly. A linear 2s..10s ramp gives up after
+// about half a minute, which is not long enough to ride out a routine upstream blip.
 func backoff(attempt int) time.Duration {
-	return time.Duration(attempt) * 2 * time.Second
+	return min(time.Duration(1<<attempt)*time.Second, maxBackoff)
 }
+
+const maxBackoff = 60 * time.Second
 
 func resetDelay(h http.Header) time.Duration {
 	secs := headerInt(h, "X-RateLimit-Reset-In", 2)

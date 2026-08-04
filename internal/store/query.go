@@ -13,6 +13,8 @@ const (
 	Artists Entity = iota
 	Albums
 	Tracks
+	Genres
+	Countries
 )
 
 func ParseEntity(s string) (Entity, error) {
@@ -23,8 +25,12 @@ func ParseEntity(s string) (Entity, error) {
 		return Albums, nil
 	case "tracks", "track":
 		return Tracks, nil
+	case "genres", "genre":
+		return Genres, nil
+	case "countries", "country":
+		return Countries, nil
 	default:
-		return 0, fmt.Errorf("unknown entity %q (want artists, albums or tracks)", s)
+		return 0, fmt.Errorf("unknown entity %q (want artists, albums, tracks, genres or countries)", s)
 	}
 }
 
@@ -43,6 +49,7 @@ type TopRow struct {
 	Name   string `json:"name"`
 	Artist string `json:"artist,omitempty"`
 	MBID   string `json:"mbid,omitempty"`
+	Code   string `json:"code,omitempty"`
 }
 
 type ListenRow struct {
@@ -59,29 +66,41 @@ var mbidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[
 
 func IsMBID(s string) bool { return mbidRe.MatchString(s) }
 
-func (f Filter) where() (string, []any) {
+func (f Filter) where() (string, []any) { return f.whereAs("") }
+
+// whereAs builds the filter's WHERE clause with every listens column qualified by alias.
+// Stats that join listens against the metadata tables must pass one, because release_mbid
+// and release_name exist on both sides and would otherwise be ambiguous.
+func (f Filter) whereAs(alias string) (string, []any) {
+	q := func(col string) string {
+		if alias == "" {
+			return col
+		}
+		return alias + "." + col
+	}
+
 	var conds []string
 	var args []any
 
 	if f.From > 0 {
-		conds = append(conds, "listened_at >= ?")
+		conds = append(conds, q("listened_at")+" >= ?")
 		args = append(args, f.From)
 	}
 	if f.To > 0 {
-		conds = append(conds, "listened_at < ?")
+		conds = append(conds, q("listened_at")+" < ?")
 		args = append(args, f.To)
 	}
 	if f.Artist != "" {
 		if IsMBID(f.Artist) {
-			conds = append(conds, "instr(artist_mbids, ?) > 0")
+			conds = append(conds, "instr("+q("artist_mbids")+", ?) > 0")
 			args = append(args, ","+f.Artist+",")
 		} else {
-			conds = append(conds, "lower(artist_name) = lower(?)")
+			conds = append(conds, "lower("+q("artist_name")+") = lower(?)")
 			args = append(args, f.Artist)
 		}
 	}
-	addMatch(&conds, &args, f.Album, "release_mbid", "release_name")
-	addMatch(&conds, &args, f.Track, "recording_mbid", "track_name")
+	addMatch(&conds, &args, f.Album, q("release_mbid"), q("release_name"))
+	addMatch(&conds, &args, f.Track, q("recording_mbid"), q("track_name"))
 
 	if len(conds) == 0 {
 		return "", nil
@@ -100,6 +119,14 @@ func addMatch(conds *[]string, args *[]any, value, mbidCol, nameCol string) {
 	}
 	*conds = append(*conds, "lower("+nameCol+") = lower(?)")
 	*args = append(*args, value)
+}
+
+// andWhere appends an extra condition to a clause built by whereAs, starting one if needed.
+func andWhere(clause, cond string) string {
+	if clause == "" {
+		return " WHERE " + cond
+	}
+	return clause + " AND " + cond
 }
 
 // topArtists groups by artist name (case-insensitive), matching how listens are credited,

@@ -41,10 +41,17 @@ func (p *progress) report(done, total int64) {
 }
 
 func (p *progress) finish(msg string) {
+	p.clear()
+	fmt.Fprintln(p.w, msg)
+}
+
+// clear erases the progress line without printing anything in its place, for phases that
+// report only once they are all done.
+func (p *progress) clear() {
 	if p.tty && p.lastLen > 0 {
 		fmt.Fprintf(p.w, "\r%s\r", strings.Repeat(" ", p.lastLen))
+		p.lastLen = 0
 	}
-	fmt.Fprintln(p.w, msg)
 }
 
 func isTTY(w io.Writer) bool {

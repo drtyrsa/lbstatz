@@ -34,6 +34,56 @@ CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+-- Entity metadata fetched from ListenBrainz/MusicBrainz, keyed by MBID rather than by
+-- listen, so re-fetching is independent of the listen history.
+CREATE TABLE IF NOT EXISTS recordings (
+	mbid               TEXT PRIMARY KEY,
+	name               TEXT NOT NULL DEFAULT '',
+	length             INTEGER NOT NULL DEFAULT 0,
+	first_release_date TEXT NOT NULL DEFAULT '',
+	first_release_year INTEGER NOT NULL DEFAULT 0,
+	release_mbid       TEXT NOT NULL DEFAULT '',
+	release_group_mbid TEXT NOT NULL DEFAULT '',
+	release_name       TEXT NOT NULL DEFAULT '',
+	release_year       INTEGER NOT NULL DEFAULT 0,
+	-- 0 marks an MBID the API has no metadata for, so enrich stops re-requesting it.
+	found              INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_recordings_year ON recordings(first_release_year);
+
+CREATE TABLE IF NOT EXISTS artists (
+	mbid       TEXT PRIMARY KEY,
+	name       TEXT NOT NULL DEFAULT '',
+	area       TEXT NOT NULL DEFAULT '',
+	country    TEXT NOT NULL DEFAULT '',
+	type       TEXT NOT NULL DEFAULT '',
+	gender     TEXT NOT NULL DEFAULT '',
+	begin_year INTEGER NOT NULL DEFAULT 0,
+	end_year   INTEGER NOT NULL DEFAULT 0,
+	found      INTEGER NOT NULL DEFAULT 1,
+	-- 0 until the MusicBrainz country pass has looked at this artist, whatever it found.
+	country_resolved INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS recording_artists (
+	recording_mbid TEXT NOT NULL,
+	artist_mbid    TEXT NOT NULL,
+	position       INTEGER NOT NULL,
+	PRIMARY KEY (recording_mbid, position)
+);
+CREATE INDEX IF NOT EXISTS idx_recording_artists_artist ON recording_artists(artist_mbid);
+
+-- Tags are stored raw at every level so genre attribution stays a query-time decision.
+CREATE TABLE IF NOT EXISTS tags (
+	entity_type TEXT NOT NULL,
+	entity_mbid TEXT NOT NULL,
+	tag         TEXT NOT NULL,
+	genre_mbid  TEXT NOT NULL DEFAULT '',
+	count       INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (entity_type, entity_mbid, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_tags_genre ON tags(entity_type, entity_mbid) WHERE genre_mbid <> '';
 `
 
 const metaBackfillComplete = "backfill_complete"
