@@ -46,9 +46,10 @@ func (f *fakeMeta) Artists(ctx context.Context, mbids []string) (map[string]list
 }
 
 type fakeCountries struct {
-	batch   map[string]string // resolved by the search index
-	direct  map[string]string // resolved only by direct lookup
-	lookups []string
+	batch     map[string]string // resolved by the search index
+	direct    map[string]string // resolved only by direct lookup
+	lookups   []string
+	failAfter int // fail once this many direct lookups have been made; 0 disables
 }
 
 func (f *fakeCountries) Countries(ctx context.Context, mbids []string) (map[string]string, error) {
@@ -61,7 +62,12 @@ func (f *fakeCountries) Countries(ctx context.Context, mbids []string) (map[stri
 	return out, nil
 }
 
+func (f *fakeCountries) SetStatus(func(string)) {}
+
 func (f *fakeCountries) Country(ctx context.Context, mbid string) (string, error) {
+	if f.failAfter > 0 && len(f.lookups) >= f.failAfter {
+		return "", errors.New("boom")
+	}
 	f.lookups = append(f.lookups, mbid)
 	return f.direct[mbid], nil
 }
@@ -235,6 +241,36 @@ func TestEnrichCountriesFallsBackSelectively(t *testing.T) {
 		t.Errorf("direct lookups = %v, want only the artist with an area and no batch result", countries.lookups)
 	}
 	if pending, _ := st.PendingCountryCount(context.Background()); pending != 0 {
+		t.Errorf("pending countries = %d, want 0", pending)
+	}
+}
+
+// A batch of direct lookups is one request per artist and takes minutes to get through, so
+// failing partway must not throw away the ones that already came back.
+func TestEnrichCountriesKeepsPartialBatch(t *testing.T) {
+	const n, ok = 5, 3
+	ctx := context.Background()
+	st := seedListens(t, n)
+	meta, countries := fakeFor(n)
+	countries.failAfter = ok
+
+	if _, err := enrichAll(ctx, meta, countries, st, io.Discard); err == nil {
+		t.Fatal("enrichAll succeeded, want the failing lookup to surface")
+	}
+	if pending, _ := st.PendingCountryCount(ctx); pending != n-ok {
+		t.Errorf("pending countries = %d, want %d: the %d resolved before the failure should be stored", pending, n-ok, ok)
+	}
+
+	// The next run picks up exactly where this one stopped rather than starting the batch over.
+	countries.failAfter = 0
+	countries.lookups = nil
+	if _, err := enrichAll(ctx, meta, countries, st, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if len(countries.lookups) != n-ok {
+		t.Errorf("lookups on resume = %d, want %d", len(countries.lookups), n-ok)
+	}
+	if pending, _ := st.PendingCountryCount(ctx); pending != 0 {
 		t.Errorf("pending countries = %d, want 0", pending)
 	}
 }
