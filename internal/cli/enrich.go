@@ -21,6 +21,9 @@ type metadataSource interface {
 type countrySource interface {
 	Countries(ctx context.Context, mbids []string) (map[string]string, error)
 	Country(ctx context.Context, mbid string) (string, error)
+	// SetStatus registers a sink for waits the source is sitting out, so the caller can put
+	// them on its progress line instead of leaving it frozen with no explanation.
+	SetStatus(func(string))
 }
 
 type enrichStats struct {
@@ -177,6 +180,10 @@ func enrichCountries(ctx context.Context, mb countrySource, st *store.Store, w i
 	prog := newProgress(w, "Countries")
 	defer prog.clear()
 
+	// This is the phase that waits on MusicBrainz, so let it say so on the progress line.
+	mb.SetStatus(prog.setNote)
+	defer mb.SetStatus(nil)
+
 	done := 0
 	for {
 		if err := ctx.Err(); err != nil {
@@ -196,28 +203,31 @@ func enrichCountries(ctx context.Context, mb countrySource, st *store.Store, w i
 			return done, err
 		}
 
+		// The fallback lookups are one request each and a batch of them takes minutes, so
+		// resolved tracks how far it got: giving up partway still commits that work, and
+		// leaves the artists behind it pending rather than recorded as country-less.
+		resolved := make([]string, 0, len(batch))
 		for _, a := range batch {
-			if found[a.MBID] != "" || a.Area == "" {
-				continue
+			if found[a.MBID] == "" && a.Area != "" {
+				code, err := mb.Country(ctx, a.MBID)
+				if err != nil {
+					// ctx may be the reason we stopped, so commit on one that still works.
+					_ = st.SaveCountries(context.WithoutCancel(ctx), resolved, found)
+					return done + len(resolved), err
+				}
+				if code != "" {
+					found[a.MBID] = code
+				}
 			}
-			if err := ctx.Err(); err != nil {
-				// Persist what this batch already resolved; ctx is cancelled, so use a fresh one.
-				_ = st.SaveCountries(context.Background(), mbids, found)
-				return done, err
-			}
-			code, err := mb.Country(ctx, a.MBID)
-			if err != nil {
-				return done, err
-			}
-			if code != "" {
-				found[a.MBID] = code
-			}
+			resolved = append(resolved, a.MBID)
+			// A batch of fallback lookups is a request each and takes minutes, so the count
+			// has to move within it rather than only once the whole batch lands.
+			prog.report(int64(done+len(resolved)), total)
 		}
 
-		if err := st.SaveCountries(ctx, mbids, found); err != nil {
+		if err := st.SaveCountries(ctx, resolved, found); err != nil {
 			return done, err
 		}
 		done += len(batch)
-		prog.report(int64(done), total)
 	}
 }

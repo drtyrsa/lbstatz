@@ -77,6 +77,13 @@ Expect the first pass over a large history to take a while — roughly a thousan
 a minute, and the country phase is capped at one MusicBrainz request per second. Interrupt
 it whenever you like; it picks up where it left off.
 
+It is meant to be left alone until it finishes. If MusicBrainz starts throttling, the pass
+waits it out — up to about ten minutes, backing off further each time, and then continuing
+at a slower steady pace that eases back once requests are getting through again. The
+progress line says what it is waiting on and counts the wait down, so a pause is never
+mistaken for a hang. Only a fault that outlasts that stops the run, and what it had already
+fetched is saved either way.
+
 The country phase needs MusicBrainz because ListenBrainz reports an artist's *area*, which
 is often a city — "Berlin", "Washington, D.C." — rather than a country. The batched search
 resolves most artists at once; those it leaves blank (its index reports nothing for
