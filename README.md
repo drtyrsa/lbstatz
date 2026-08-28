@@ -37,6 +37,7 @@ live progress.
 
 ```sh
 lbstatz sync                 # incremental: only listens newer than what you already have
+lbstatz sync --remap         # also re-check listens that arrived unidentified
 lbstatz sync --from-scratch  # wipe and re-download the entire history
 lbstatz sync --no-enrich     # listens only, skipping the metadata pass
 ```
@@ -49,6 +50,40 @@ retried automatically. For a large history the first sync may take several runs;
 
 Once the listens are in, `sync` runs [`enrich`](#enrich) to fill in release dates, artist
 countries and genres for anything it hasn't seen before. That pass is resumable too.
+
+#### `--remap`
+
+Plenty of listens arrive with no MBIDs at all — a player submitted nothing but names, and
+ListenBrainz's mapper couldn't match them. Those listens are dead weight for the genre,
+country and era stats, which are all keyed off the recording MBID.
+
+That's not permanent. MusicBrainz gains recordings constantly, ListenBrainz rebuilds its
+mapper index, and mappings you make by hand on the website land too — so a listen that was
+unidentifiable last year may well be identified now. `--remap` goes back and looks:
+
+```sh
+lbstatz sync --remap
+```
+
+It doesn't re-walk your whole history. It jumps from one unidentified listen to the next,
+skipping the stretches that are already fully mapped, so a history whose gaps are clustered
+— one player that submitted poor metadata for a few months — costs a handful of requests.
+Scattered gaps cost no more than a full walk would. Anything it identifies flows straight
+into the `enrich` pass in the same run, so the new MBIDs come back with metadata attached.
+
+Run it occasionally rather than every time; a plain `sync` is enough day to day. It reports
+how many listens it matched and how many still have none, and that residue never gets
+marked as settled — the point is that MusicBrainz keeps growing, so it's always worth
+another look later.
+
+Two things it won't do. It's skipped while the history is still downloading for the first
+time, since the backfill is already fetching those listens with current mappings. And it
+can't be combined with `--from-scratch`, which re-downloads everything anyway.
+
+You get a little of this for free without the flag: every `sync` walks back through the
+listens it already has until it meets stored ones, and that overlap now picks up any
+mappings it has gained. That covers the common case of ListenBrainz identifying a listen an
+hour after you scrobbled it. `--remap` is for reaching further back than the overlap.
 
 ### `enrich`
 
@@ -184,7 +219,8 @@ the release axis that `--bucket` shapes.
   standard edition count separately.
 - **Missing MBIDs.** Many listens carry no MBIDs. Albums and tracks are keyed by MBID when
   present (so different credits of the same recording or release merge) and fall back to
-  name otherwise, so nothing is dropped.
+  name otherwise, so nothing is dropped — though the genre, country and era stats can't see
+  those listens at all. [`sync --remap`](#--remap) goes back and tries to identify them.
 - **Artists** are grouped by their credited name, case-insensitively — the way your listens
   are labelled — so everything scrobbled as "Skrillex" is one artist, while a genuinely
   different credit like "Skrillex & Diplo" is its own. Each artist is tagged with its

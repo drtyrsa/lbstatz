@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS listens (
 	PRIMARY KEY (listened_at, recording_msid)
 );
 CREATE INDEX IF NOT EXISTS idx_listens_listened_at ON listens(listened_at);
+-- Partial index over the listens ListenBrainz has not identified, which the remap pass walks
+-- newest-first. It covers only the unidentified rows, so it stays small as coverage improves.
+CREATE INDEX IF NOT EXISTS idx_listens_unmapped ON listens(listened_at) WHERE recording_mbid = '';
 
 CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
@@ -107,38 +110,99 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-// UpsertListens inserts listens, ignoring ones already stored, and reports how many were new.
-func (s *Store) UpsertListens(ctx context.Context, listens []listenbrainz.Listen) (int, error) {
+// UpsertResult reports what a batch of listens changed: rows stored for the first time, and
+// rows already held that gained MBIDs they were missing.
+type UpsertResult struct {
+	Inserted int
+	Remapped int
+}
+
+// Add sums two results, for callers accumulating across pages.
+func (r UpsertResult) Add(o UpsertResult) UpsertResult {
+	return UpsertResult{Inserted: r.Inserted + o.Inserted, Remapped: r.Remapped + o.Remapped}
+}
+
+// UpsertListens stores listens, filling in MBIDs on the ones already held. ListenBrainz maps
+// listens to MusicBrainz in the background and keeps improving those mappings, so a listen
+// that arrived unidentified can gain MBIDs long after it was downloaded. Only empty columns
+// are filled: a mapping that has since been withdrawn must never blank one already stored,
+// and MBIDs the listen was submitted with are authoritative.
+func (s *Store) UpsertListens(ctx context.Context, listens []listenbrainz.Listen) (UpsertResult, error) {
+	var res UpsertResult
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return res, err
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, `
+	insert, err := tx.PrepareContext(ctx, `
 		INSERT OR IGNORE INTO listens
 			(listened_at, recording_msid, artist_name, track_name, release_name, artist_mbid, artist_mbids, recording_mbid, release_mbid)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
-		return 0, err
+		return res, err
 	}
-	defer stmt.Close()
+	defer insert.Close()
 
-	inserted := 0
+	// The trailing condition holds the update to rows it would really change, so an unchanged
+	// listen is not rewritten and RowsAffected counts genuine remappings rather than passes.
+	fill, err := tx.PrepareContext(ctx, `
+		UPDATE listens SET
+			artist_mbid    = COALESCE(NULLIF(?1, ''), artist_mbid),
+			artist_mbids   = COALESCE(NULLIF(?2, ''), artist_mbids),
+			recording_mbid = COALESCE(NULLIF(?3, ''), recording_mbid),
+			release_mbid   = COALESCE(NULLIF(?4, ''), release_mbid)
+		WHERE listened_at = ?5 AND recording_msid = ?6
+		  AND (   (artist_mbid    = '' AND ?1 <> '')
+		       OR (artist_mbids   = '' AND ?2 <> '')
+		       OR (recording_mbid = '' AND ?3 <> '')
+		       OR (release_mbid   = '' AND ?4 <> ''))`)
+	if err != nil {
+		return res, err
+	}
+	defer fill.Close()
+
 	for _, l := range listens {
-		res, err := stmt.ExecContext(ctx, l.ListenedAt, l.RecordingMSID, l.ArtistName, l.TrackName,
-			l.ReleaseName, l.ArtistMBID, artistMBIDsKey(l.ArtistMBIDs), l.RecordingMBID, l.ReleaseMBID)
+		mbids := artistMBIDsKey(l.ArtistMBIDs)
+		r, err := insert.ExecContext(ctx, l.ListenedAt, l.RecordingMSID, l.ArtistName, l.TrackName,
+			l.ReleaseName, l.ArtistMBID, mbids, l.RecordingMBID, l.ReleaseMBID)
 		if err != nil {
-			return 0, err
+			return res, err
 		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			inserted++
+		if n, _ := r.RowsAffected(); n > 0 {
+			res.Inserted++
+			continue
+		}
+		// Already stored, so only the identity columns can have moved on since.
+		r, err = fill.ExecContext(ctx, l.ArtistMBID, mbids, l.RecordingMBID, l.ReleaseMBID,
+			l.ListenedAt, l.RecordingMSID)
+		if err != nil {
+			return res, err
+		}
+		if n, _ := r.RowsAffected(); n > 0 {
+			res.Remapped++
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, err
+		return res, err
 	}
-	return inserted, nil
+	return res, nil
+}
+
+// UnmappedListenCount reports how many listens ListenBrainz has no recording MBID for. They
+// are dead weight for every metadata stat, since those are all keyed off that MBID.
+func (s *Store) UnmappedListenCount(ctx context.Context) (int64, error) {
+	return s.countRows(ctx, `SELECT COUNT(*) FROM listens WHERE recording_mbid = ''`)
+}
+
+// NewestUnmappedBefore returns the timestamp of the newest listen with no recording MBID
+// older than before (0 = no bound), or 0 when there is none left to look at.
+func (s *Store) NewestUnmappedBefore(ctx context.Context, before int64) (int64, error) {
+	var ts sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT MAX(listened_at) FROM listens
+		WHERE recording_mbid = '' AND (?1 = 0 OR listened_at < ?1)`, before).Scan(&ts)
+	return ts.Int64, err
 }
 
 func (s *Store) Count(ctx context.Context) (int64, error) {
