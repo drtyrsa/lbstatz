@@ -63,12 +63,15 @@ func TestUpsertDedupes(t *testing.T) {
 		mk(base+10, "m1", "Radiohead", "Karma Police", "OK Computer", artistRA, recKP, albOK),
 		mk(base+80, "m8", "Radiohead", "Fake Plastic Trees", "The Bends", artistRA, "", ""),
 	}
-	inserted, err := s.UpsertListens(ctx, again)
+	res, err := s.UpsertListens(ctx, again)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inserted != 1 {
-		t.Fatalf("inserted = %d, want 1", inserted)
+	if res.Inserted != 1 {
+		t.Fatalf("inserted = %d, want 1", res.Inserted)
+	}
+	if res.Remapped != 0 {
+		t.Fatalf("remapped = %d, want 0: re-storing an unchanged listen must not count", res.Remapped)
 	}
 	if n, _ := s.Count(ctx); n != 8 {
 		t.Fatalf("count = %d, want 8", n)
@@ -338,5 +341,54 @@ func TestIsMBID(t *testing.T) {
 		if IsMBID(s) {
 			t.Errorf("%q should not be an mbid", s)
 		}
+	}
+}
+
+func TestUpsertFillsMissingMBIDsWithoutBlankingStoredOnes(t *testing.T) {
+	s := seed(t)
+	ctx := context.Background()
+
+	// Björk's listen (m7) went in unidentified; ListenBrainz has since mapped it.
+	mapped := mk(base+70, "m7", "Björk", "Army of Me", "Post", artistRA, recNS, albOK)
+	res, err := s.UpsertListens(ctx, []listenbrainz.Listen{mapped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Inserted != 0 || res.Remapped != 1 {
+		t.Fatalf("res = %+v, want 0 inserted, 1 remapped", res)
+	}
+	if n, _ := s.Count(ctx); n != 7 {
+		t.Fatalf("count = %d, want 7: remapping must not add rows", n)
+	}
+
+	// A later fetch that reports no mapping at all must leave the stored one alone: mappings
+	// get withdrawn, and losing MBIDs we already hold would silently shrink the stats.
+	blank := mk(base+70, "m7", "Björk", "Army of Me", "Post", "", "", "")
+	res, err = s.UpsertListens(ctx, []listenbrainz.Listen{blank})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Remapped != 0 {
+		t.Fatalf("remapped = %d, want 0: an empty mapping changes nothing", res.Remapped)
+	}
+	if n, err := s.UnmappedListenCount(ctx); err != nil || n != 0 {
+		t.Fatalf("unmapped = %d (err %v), want 0", n, err)
+	}
+}
+
+func TestUnmappedListenCursor(t *testing.T) {
+	s := seed(t)
+	ctx := context.Background()
+
+	// seed leaves exactly one listen (m7, the newest) without a recording MBID.
+	if n, err := s.UnmappedListenCount(ctx); err != nil || n != 1 {
+		t.Fatalf("unmapped = %d (err %v), want 1", n, err)
+	}
+	if ts, err := s.NewestUnmappedBefore(ctx, 0); err != nil || ts != base+70 {
+		t.Fatalf("newest unmapped = %d (err %v), want %d", ts, err, base+70)
+	}
+	// The bound is exclusive, so asking below it must report that nothing is left.
+	if ts, err := s.NewestUnmappedBefore(ctx, base+70); err != nil || ts != 0 {
+		t.Fatalf("newest unmapped before itself = %d (err %v), want 0", ts, err)
 	}
 }

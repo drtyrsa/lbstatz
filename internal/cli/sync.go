@@ -20,15 +20,24 @@ type listenSource interface {
 func newSyncCmd(configPath *string) *cobra.Command {
 	var fromScratch bool
 	var noEnrich bool
+	var remap bool
 
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Download listens from ListenBrainz into the local database",
 		Long: "Download listens into the local database, then fetch metadata for any new\n" +
 			"recordings and artists so the genre, country and era stats stay current.\n" +
-			"Both halves are resumable; interrupt with Ctrl-C and run sync again.",
+			"Both halves are resumable; interrupt with Ctrl-C and run sync again.\n\n" +
+			"With --remap it also re-checks listens ListenBrainz could not identify when they\n" +
+			"were downloaded, which is worth doing every so often as MusicBrainz grows.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// A from-scratch sync re-downloads every listen with its current mapping, so it
+			// already does everything --remap would, and doing both would only repeat the work.
+			if remap && fromScratch {
+				return fmt.Errorf("--remap cannot be combined with --from-scratch")
+			}
+
 			cfg, err := loadConfig(*configPath)
 			if err != nil {
 				return err
@@ -42,7 +51,7 @@ func newSyncCmd(configPath *string) *cobra.Command {
 			client := listenbrainz.New(listenbrainz.DefaultBaseURL, cfg.Token, cfg.Username)
 			prog := newProgress(os.Stderr, "Downloaded")
 
-			n, err := syncListens(cmd.Context(), client, st, fromScratch, prog.report)
+			counts, err := syncListens(cmd.Context(), client, st, fromScratch, prog.report)
 			if err != nil && !errors.Is(err, context.Canceled) {
 				prog.finish("")
 				return err
@@ -54,14 +63,24 @@ func newSyncCmd(configPath *string) *cobra.Command {
 			backfillDone, _ := st.BackfillComplete(bg)
 
 			if errors.Is(err, context.Canceled) {
-				prog.finish(fmt.Sprintf("Interrupted: %d new listens saved (%s). Run sync again to continue.", n, storedOf(stored, remote)))
+				prog.finish(fmt.Sprintf("Interrupted: %d new listens saved (%s). Run sync again to continue.", counts.Inserted, storedOf(stored, remote)))
 				return nil
 			}
 			if !backfillDone && remote > stored {
-				prog.finish(fmt.Sprintf("Stopped early: %d new listens saved (%s). Run sync again to continue.", n, storedOf(stored, remote)))
+				prog.finish(fmt.Sprintf("Stopped early: %d new listens saved (%s). Run sync again to continue.", counts.Inserted, storedOf(stored, remote)))
 				return nil
 			}
-			prog.finish(fmt.Sprintf("Downloaded %d new listens (%s).", n, storedOf(stored, remote)))
+			prog.finish(fmt.Sprintf("Downloaded %d new listens%s (%s).",
+				counts.Inserted, remappedSuffix(counts.Remapped), storedOf(stored, remote)))
+
+			if remap {
+				if err := runRemap(cmd.Context(), client, st); err != nil {
+					if errors.Is(err, context.Canceled) {
+						return nil
+					}
+					return err
+				}
+			}
 
 			if noEnrich {
 				return nil
@@ -88,6 +107,7 @@ func newSyncCmd(configPath *string) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&fromScratch, "from-scratch", false, "re-download the entire history instead of only new listens")
 	cmd.Flags().BoolVar(&noEnrich, "no-enrich", false, "download listens only, skipping the metadata pass")
+	cmd.Flags().BoolVar(&remap, "remap", false, "also re-check listens ListenBrainz could not identify when they were downloaded")
 	return cmd
 }
 
@@ -98,72 +118,191 @@ func storedOf(stored, remote int64) string {
 	return fmt.Sprintf("%d stored", stored)
 }
 
+// remappedSuffix mentions listens that gained MBIDs, which the top-up overlap fills in as a
+// side effect of every sync, and says nothing when there were none.
+func remappedSuffix(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf(", remapped %d", n)
+}
+
+// runRemap drives the remap sweep and reports what it turned up. It is skipped while the
+// history is still downloading: re-walking a range that isn't fully stored yet spends
+// requests on listens the backfill is about to fetch with current mappings anyway.
+func runRemap(ctx context.Context, client listenSource, st *store.Store) error {
+	backfillDone, err := st.BackfillComplete(ctx)
+	if err != nil {
+		return err
+	}
+	if !backfillDone {
+		fmt.Fprintln(os.Stderr, "Skipping remap: the history is still downloading. Run sync until it finishes, then remap.")
+		return nil
+	}
+
+	before, err := st.UnmappedListenCount(ctx)
+	if err != nil {
+		return err
+	}
+	if before == 0 {
+		fmt.Fprintln(os.Stderr, "Remap: every listen is already identified.")
+		return nil
+	}
+
+	prog := newProgress(os.Stderr, "Remapping")
+	counts, err := remapListens(ctx, client, st, prog.report)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		prog.finish("")
+		return err
+	}
+
+	// Whatever the sweep managed is committed, so report against the database either way —
+	// including when ctx is the reason it stopped.
+	left, _ := st.UnmappedListenCount(context.WithoutCancel(ctx))
+	if errors.Is(err, context.Canceled) {
+		prog.finish(fmt.Sprintf("Interrupted: identified %d listens, %d still unmatched. Run sync --remap again to continue.",
+			before-left, left))
+		return err
+	}
+
+	msg := fmt.Sprintf("Remapped %d of %d unidentified listens; %d still have no match.", before-left, before, left)
+	if counts.Inserted > 0 {
+		msg += fmt.Sprintf(" Also stored %d listens that were missing locally.", counts.Inserted)
+	}
+	prog.finish(msg)
+	return nil
+}
+
 // syncListens brings the local database up to date in two phases. First it tops up any
 // listens newer than what is stored. Then, unless a previous run already walked the whole
 // history, it backfills older listens starting below the oldest stored one. Because the
 // backfill cursor is the oldest stored timestamp, an interrupted sync resumes cleanly.
-func syncListens(ctx context.Context, client listenSource, st *store.Store, fromScratch bool, report func(done, total int64)) (int, error) {
+// The top-up page walks back until it meets listens already stored, so that overlap is
+// re-fetched every run and any MBIDs it has gained since are filled in for free — which
+// covers the common case, a listen ListenBrainz identifies an hour after it was scrobbled.
+// Reaching further back than the overlap is what --remap is for.
+func syncListens(ctx context.Context, client listenSource, st *store.Store, fromScratch bool, report func(done, total int64)) (store.UpsertResult, error) {
+	var counts store.UpsertResult
 	if fromScratch {
 		if err := st.Clear(ctx); err != nil {
-			return 0, err
+			return counts, err
 		}
 	}
 
 	remoteTotal, _ := client.ListenCount(ctx)
 	storedBefore, err := st.Count(ctx)
 	if err != nil {
-		return 0, err
+		return counts, err
 	}
 
-	newCount := 0
 	progress := func() {
 		if report != nil {
-			report(storedBefore+int64(newCount), remoteTotal)
+			report(storedBefore+int64(counts.Inserted), remoteTotal)
 		}
 	}
 	progress()
 
 	newest, err := st.MaxListenedAt(ctx)
 	if err != nil {
-		return newCount, err
+		return counts, err
 	}
 	if newest > 0 {
-		if _, err := walkBack(ctx, client, st, 0, newest, &newCount, progress); err != nil {
-			return newCount, err
+		if _, err := walkBack(ctx, client, st, 0, newest, &counts, progress); err != nil {
+			return counts, err
 		}
 	}
 
 	backfillDone, err := st.BackfillComplete(ctx)
 	if err != nil {
-		return newCount, err
+		return counts, err
 	}
 	if !backfillDone {
 		oldest, err := st.MinListenedAt(ctx)
 		if err != nil {
-			return newCount, err
+			return counts, err
 		}
 		// max_ts is exclusive; +1 re-requests the boundary second so listens sharing it aren't skipped.
 		cursor := oldest
 		if cursor > 0 {
 			cursor++
 		}
-		reachedOldest, err := walkBack(ctx, client, st, cursor, 0, &newCount, progress)
+		reachedOldest, err := walkBack(ctx, client, st, cursor, 0, &counts, progress)
 		if err != nil {
-			return newCount, err
+			return counts, err
 		}
 		if reachedOldest {
 			if err := st.SetBackfillComplete(ctx, true); err != nil {
-				return newCount, err
+				return counts, err
 			}
 		}
 	}
-	return newCount, nil
+	return counts, nil
+}
+
+// remapListens re-fetches the stretches of history that still hold unidentified listens, so
+// mappings ListenBrainz has made since those listens were downloaded get picked up.
+//
+// Rather than re-walking everything it jumps the cursor from one unidentified listen to the
+// next, skipping stretches that are already fully mapped. A history whose gaps are clustered
+// — one player that submitted poor metadata for a few months — costs a handful of requests,
+// and one where they are scattered evenly costs no more than a full walk would.
+func remapListens(ctx context.Context, client listenSource, st *store.Store, report func(done, total int64)) (store.UpsertResult, error) {
+	var res store.UpsertResult
+
+	total, err := st.UnmappedListenCount(ctx)
+	if err != nil || total == 0 {
+		return res, err
+	}
+	cursor, err := st.NewestUnmappedBefore(ctx, 0)
+	if err != nil {
+		return res, err
+	}
+
+	for cursor > 0 {
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
+		// max_ts is exclusive, so aim one second above the listen the cursor is targeting.
+		page, err := client.Page(ctx, cursor+1)
+		if err != nil {
+			return res, err
+		}
+		if len(page.Listens) == 0 {
+			return res, nil
+		}
+
+		batch, err := st.UpsertListens(ctx, page.Listens)
+		if err != nil {
+			return res, err
+		}
+		res = res.Add(batch)
+
+		if report != nil {
+			left, err := st.UnmappedListenCount(ctx)
+			if err != nil {
+				return res, err
+			}
+			report(max(0, total-left), total)
+		}
+
+		if len(page.Listens) < listenbrainz.MaxItemsPerGet {
+			return res, nil
+		}
+		// Resume strictly below the page just covered so the cursor always moves, whether or
+		// not this page's listens turned out to be mappable.
+		oldest := page.Listens[len(page.Listens)-1].ListenedAt
+		cursor, err = st.NewestUnmappedBefore(ctx, oldest)
+		if err != nil {
+			return res, err
+		}
+	}
+	return res, nil
 }
 
 // walkBack pages from maxTS (0 = most recent) toward older listens, storing each page.
 // It stops at boundary (exclusive; 0 = no boundary) or when the history runs out, and
 // reports whether it reached the oldest listen.
-func walkBack(ctx context.Context, client listenSource, st *store.Store, maxTS, boundary int64, newCount *int, progress func()) (bool, error) {
+func walkBack(ctx context.Context, client listenSource, st *store.Store, maxTS, boundary int64, counts *store.UpsertResult, progress func()) (bool, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return false, err
@@ -191,11 +330,11 @@ func walkBack(ctx context.Context, client listenSource, st *store.Store, maxTS, 
 			batch = kept
 		}
 
-		inserted, err := st.UpsertListens(ctx, batch)
+		res, err := st.UpsertListens(ctx, batch)
 		if err != nil {
 			return false, err
 		}
-		*newCount += inserted
+		*counts = counts.Add(res)
 		progress()
 
 		if reachedBoundary {
