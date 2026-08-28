@@ -204,6 +204,20 @@ func walkBack(ctx context.Context, client listenSource, st *store.Store, maxTS, 
 		if len(page.Listens) < listenbrainz.MaxItemsPerGet {
 			return true, nil
 		}
-		maxTS = page.Listens[len(page.Listens)-1].ListenedAt
+
+		// max_ts is exclusive, so the cursor goes one second above the oldest listen on this
+		// page rather than onto it: stepping onto it would drop any other listen sharing that
+		// exact second, which is how a page boundary silently loses a listen for good. The
+		// duplicates that re-requesting the second brings back cost nothing, the upsert
+		// already dedupes them.
+		oldest := page.Listens[len(page.Listens)-1].ListenedAt
+		next := oldest + 1
+		if maxTS > 0 && next >= maxTS {
+			// A whole page inside a single second. The API offers no way to page within one,
+			// so asking again would return this same page forever; step past it instead and
+			// accept that the rest of that second is out of reach.
+			next = oldest
+		}
+		maxTS = next
 	}
 }
