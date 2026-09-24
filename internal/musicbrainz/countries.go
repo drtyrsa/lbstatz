@@ -1,5 +1,10 @@
 package musicbrainz
 
+import (
+	"fmt"
+	"strings"
+)
+
 // countryNames maps ISO 3166-1 alpha-2 codes to display names. Generated from the
 // iso-codes database; embedded so country stats need no extra lookups at runtime.
 var countryNames = map[string]string{
@@ -261,4 +266,18 @@ func CountryName(code string) string {
 		return n
 	}
 	return code
+}
+
+// ParseCountry accepts an ISO 3166-1 alpha-2 code or a display name, ignoring case.
+func ParseCountry(value string) (string, error) {
+	s := strings.TrimSpace(value)
+	if code := strings.ToUpper(s); countryNames[code] != "" {
+		return code, nil
+	}
+	for code, name := range countryNames {
+		if strings.EqualFold(s, name) {
+			return code, nil
+		}
+	}
+	return "", fmt.Errorf("unknown country %q (use a two-letter code or country name, e.g. GB or United Kingdom)", value)
 }

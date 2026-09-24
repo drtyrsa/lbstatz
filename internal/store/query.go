@@ -35,12 +35,14 @@ func ParseEntity(s string) (Entity, error) {
 }
 
 // Filter narrows the listen set. Artist/Album/Track accept either a name or an MBID.
+// Country is an ISO 3166-1 alpha-2 code for the listen's primary artist.
 type Filter struct {
-	From   int64
-	To     int64
-	Artist string
-	Album  string
-	Track  string
+	From    int64
+	To      int64
+	Artist  string
+	Album   string
+	Track   string
+	Country string
 }
 
 type TopRow struct {
@@ -101,6 +103,10 @@ func (f Filter) whereAs(alias string) (string, []any) {
 	}
 	addMatch(&conds, &args, f.Album, q("release_mbid"), q("release_name"))
 	addMatch(&conds, &args, f.Track, q("recording_mbid"), q("track_name"))
+	if f.Country != "" {
+		conds = append(conds, q("artist_mbid")+" IN (SELECT mbid FROM artists WHERE country = ?)")
+		args = append(args, strings.ToUpper(f.Country))
+	}
 
 	if len(conds) == 0 {
 		return "", nil

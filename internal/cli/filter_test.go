@@ -1,9 +1,29 @@
 package cli
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestToFilterCountry(t *testing.T) {
+	for _, value := range []string{"GB", "gb", "United Kingdom", " united KINGDOM "} {
+		t.Run(value, func(t *testing.T) {
+			f, err := (&filterFlags{country: value, artist: "Radiohead", last: 7}).toFilter()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if f.Country != "GB" || f.Artist != "Radiohead" || f.From == 0 {
+				t.Fatalf("filter = %+v, want GB composed with artist and date filters", f)
+			}
+		})
+	}
+	for _, value := range []string{"Atlantis", "GBR", "G", "G1"} {
+		if _, err := (&filterFlags{country: value}).toFilter(); err == nil || !strings.Contains(err.Error(), "invalid --country") {
+			t.Errorf("country %q: error = %v, want an invalid --country error", value, err)
+		}
+	}
+}
 
 func TestLastDaysStart(t *testing.T) {
 	now := time.Date(2024, 3, 10, 15, 4, 5, 0, time.Local)

@@ -136,6 +136,7 @@ lbstatz top tracks  --artist "Radiohead"                 # top tracks by an arti
 lbstatz top tracks  --album  "OK Computer"               # top tracks on an album
 lbstatz top albums  --artist "Radiohead" --from 2024-01-01 --to 2024-12-31
 lbstatz top albums  --last 30                            # the last 30 days
+lbstatz top artists --country GB --last 30               # artists from the United Kingdom
 lbstatz top tracks  --track  "Karma Police"              # one row: total plays of a track
 lbstatz top artists -n 20 --json
 lbstatz top genres    -n 15                              # needs enrich
@@ -190,6 +191,7 @@ The raw listen log, most recent first — same filters as `top`.
 lbstatz listens --artist "Björk" -n 50
 lbstatz listens --album "Homogenic" --from 2023-06-01 --json
 lbstatz listens --last 7                                 # everything from the last week
+lbstatz listens --country "Iceland" --last 7             # listens by artists from Iceland
 ```
 
 ## Flags
@@ -204,6 +206,7 @@ Shared by `top`, `eras` and `listens`:
 | `--artist` | Filter by artist, as a name or MBID. |
 | `--album` | Filter by album (release), as a name or MBID. |
 | `--track` | Filter by track (recording), as a name or MBID. |
+| `--country` | Filter by the primary artist's country, as a two-letter code or country name (requires `enrich`). |
 | `-n, --limit` | Cap the number of rows (`0` = all, the default). |
 | `--json` | Emit JSON instead of text. |
 
@@ -217,6 +220,9 @@ the release axis that `--bucket` shapes.
   treated as an MBID; otherwise it's a name. Name matching is exact and case-insensitive.
 - **Albums** are releases exactly as your listens report them — a deluxe edition and the
   standard edition count separately.
+- **Country filters** accept the two-letter codes or names shown by `top countries`,
+  case-insensitively (e.g. `GB` or `United Kingdom`). They use the same primary-artist
+  attribution as country stats. Listens without a known artist country are excluded.
 - **Missing MBIDs.** Many listens carry no MBIDs. Albums and tracks are keyed by MBID when
   present (so different credits of the same recording or release merge) and fall back to
   name otherwise, so nothing is dropped — though the genre, country and era stats can't see
