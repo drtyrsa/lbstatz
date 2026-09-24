@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/drtyrsa/lbstatz/internal/musicbrainz"
 	"github.com/drtyrsa/lbstatz/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -16,6 +17,7 @@ type filterFlags struct {
 	artist  string
 	album   string
 	track   string
+	country string
 	limit   int
 	jsonOut bool
 }
@@ -28,6 +30,7 @@ func (ff *filterFlags) bind(cmd *cobra.Command) {
 	f.StringVar(&ff.artist, "artist", "", "filter by artist name or MBID")
 	f.StringVar(&ff.album, "album", "", "filter by album (release) name or MBID")
 	f.StringVar(&ff.track, "track", "", "filter by track name or MBID")
+	f.StringVar(&ff.country, "country", "", "filter by primary artist's country code or name (requires enrich)")
 	f.IntVarP(&ff.limit, "limit", "n", 0, "limit rows (0 = all)")
 	f.BoolVar(&ff.jsonOut, "json", false, "output JSON instead of text")
 }
@@ -50,12 +53,20 @@ func (ff *filterFlags) toFilter() (store.Filter, error) {
 			return store.Filter{}, err
 		}
 	}
+	var country string
+	if strings.TrimSpace(ff.country) != "" {
+		country, err = musicbrainz.ParseCountry(ff.country)
+		if err != nil {
+			return store.Filter{}, fmt.Errorf("invalid --country: %w", err)
+		}
+	}
 	return store.Filter{
-		From:   from,
-		To:     to,
-		Artist: ff.artist,
-		Album:  ff.album,
-		Track:  ff.track,
+		From:    from,
+		To:      to,
+		Artist:  ff.artist,
+		Album:   ff.album,
+		Track:   ff.track,
+		Country: country,
 	}, nil
 }
 
